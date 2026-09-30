@@ -1,0 +1,461 @@
+import os
+import sys
+import shutil
+import stat
+import subprocess
+import threading
+import queue
+import re
+import locale
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+
+def get_runtime_dir():
+    """
+    获取程序运行时的真实目录
+    - PyInstaller 打包的 exe: 返回临时解压目录 (sys._MEIPASS)
+    - 普通 python 脚本: 返回脚本所在目录
+    """
+    if getattr(sys, 'frozen', False):
+        return sys._MEIPASS
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_application_path():
+    """获取 exe 或 py 脚本所在的物理目录（用于默认路径）"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
+        return os.path.dirname(os.path.abspath(__file__))
+
+
+def get_system_encoding():
+    """获取系统控制台编码（Windows中文系统通常为 gbk/cp936）"""
+    try:
+        return locale.getpreferredencoding(False)
+    except Exception:
+        return 'utf-8'
+
+
+def force_remove_readonly(func, path, excinfo):
+    """shutil.rmtree 的 onerror 回调：处理只读文件"""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+    except Exception:
+        pass
+
+
+class CompressApp7Z:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("批量 7Z 压缩工具 (单文件内嵌引擎版)")
+        self.root.geometry("680x550")
+        self.root.minsize(600, 450)
+
+        self.msg_queue = queue.Queue()
+        self.is_running = False
+        self.process = None
+
+        self.console_encoding = get_system_encoding()
+        self.seven_zip_path = self.find_embedded_7z()
+
+        self.setup_ui()
+        self.process_queue()
+
+    def find_embedded_7z(self):
+        """寻找 7z.exe：优先内嵌 -> 环境变量 -> 默认安装路径 -> 同级目录"""
+        # 1. PyInstaller 释放的临时目录
+        runtime_dir = get_runtime_dir()
+        embedded_7z = os.path.join(runtime_dir, "7z.exe")
+        if os.path.exists(embedded_7z):
+            return embedded_7z
+
+        # 2. 系统环境变量
+        path_from_env = shutil.which("7z")
+        if path_from_env:
+            return path_from_env
+
+        # 3. Windows 默认安装路径
+        default_paths = [
+            r"C:\Program Files\7-Zip\7z.exe",
+            r"C:\Program Files (x86)\7-Zip\7z.exe"
+        ]
+        for p in default_paths:
+            if os.path.exists(p):
+                return p
+
+        # 4. 脚本/exe 同级目录（绿色版兼容）
+        local_7z = os.path.join(get_application_path(), "7z.exe")
+        if os.path.exists(local_7z):
+            return local_7z
+
+        return None
+
+    def setup_ui(self):
+        main_frame = ttk.Frame(self.root, padding="15")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # --- 引擎状态 ---
+        engine_frame = ttk.LabelFrame(main_frame, text="引擎状态", padding="5")
+        engine_frame.pack(fill=tk.X, pady=(0, 10))
+
+        if self.seven_zip_path:
+            if (getattr(sys, 'frozen', False) and
+                    os.path.dirname(self.seven_zip_path) == get_runtime_dir()):
+                status_text = "✅ 已加载内嵌 7-Zip 引擎"
+            else:
+                status_text = f"✅ 已找到 7-Zip 引擎: {self.seven_zip_path}"
+            self.lbl_engine = ttk.Label(engine_frame, text=status_text, foreground="green")
+        else:
+            self.lbl_engine = ttk.Label(
+                engine_frame,
+                text="❌ 未找到 7-Zip 引擎！请安装 7-Zip 或将 7z.exe/7z.dll 放在同目录。",
+                foreground="red"
+            )
+        self.lbl_engine.pack(anchor=tk.W)
+
+        # --- 路径设置 ---
+        path_frame = ttk.LabelFrame(main_frame, text="目录设置", padding="10")
+        path_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Label(path_frame, text="总文件夹:").grid(row=0, column=0, sticky=tk.W)
+        self.entry_source = ttk.Entry(path_frame, width=55)
+        self.entry_source.grid(row=0, column=1, padx=5)
+        self.entry_source.insert(0, get_application_path())
+        ttk.Button(path_frame, text="浏览...", command=self.browse_source).grid(row=0, column=2)
+
+        ttk.Label(path_frame, text="输出目录:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.entry_output = ttk.Entry(path_frame, width=55)
+        self.entry_output.grid(row=1, column=1, padx=5, pady=5)
+        self.entry_output.insert(0, "默认保存在总文件夹内")
+        ttk.Button(path_frame, text="浏览...", command=self.browse_output).grid(row=1, column=2)
+
+        # --- 功能选项 ---
+        opt_frame = ttk.LabelFrame(main_frame, text="功能选项", padding="10")
+        opt_frame.pack(fill=tk.X, pady=(0, 10))
+
+        self.var_pwd = tk.BooleanVar(value=False)
+        self.var_del = tk.BooleanVar(value=False)
+
+        ttk.Checkbutton(opt_frame, text="加密压缩包 (运行时弹出密码框)",
+                        variable=self.var_pwd).grid(row=0, column=0, sticky=tk.W)
+        ttk.Checkbutton(opt_frame, text="压缩后删除源文件夹 (调用 7z 原生校验)",
+                        variable=self.var_del).grid(row=1, column=0, sticky=tk.W, pady=5)
+
+        # --- 进度显示 ---
+        prog_frame = ttk.LabelFrame(main_frame, text="压缩进度", padding="10")
+        prog_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+
+        self.lbl_status = ttk.Label(prog_frame, text="状态: 等待开始...")
+        self.lbl_status.pack(anchor=tk.W)
+
+        self.prog_total = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL, mode='determinate')
+        self.prog_total.pack(fill=tk.X, pady=(5, 0))
+
+        self.lbl_file = ttk.Label(prog_frame, text="当前文件: -")
+        self.lbl_file.pack(anchor=tk.W, pady=(10, 0))
+        self.prog_file = ttk.Progressbar(prog_frame, orient=tk.HORIZONTAL, mode='determinate')
+        self.prog_file.pack(fill=tk.X, pady=(2, 0))
+
+        self.txt_log = tk.Text(prog_frame, height=8, state=tk.DISABLED,
+                               wrap=tk.WORD, font=("Consolas", 9))
+        self.txt_log.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        scrollbar = ttk.Scrollbar(self.txt_log, command=self.txt_log.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_log.config(yscrollcommand=scrollbar.set)
+
+        # --- 控制按钮 ---
+        btn_frame = ttk.Frame(main_frame)
+        btn_frame.pack(fill=tk.X)
+
+        self.btn_start = ttk.Button(btn_frame, text="🚀 开始压缩", command=self.start_task)
+        self.btn_start.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.btn_stop = ttk.Button(btn_frame, text="⏹ 强制停止", command=self.stop_task, state=tk.DISABLED)
+        self.btn_stop.pack(side=tk.LEFT)
+
+    def browse_source(self):
+        path = filedialog.askdirectory(title="选择总文件夹")
+        if path:
+            self.entry_source.delete(0, tk.END)
+            self.entry_source.insert(0, path)
+
+    def browse_output(self):
+        path = filedialog.askdirectory(title="选择输出目录")
+        if path:
+            self.entry_output.delete(0, tk.END)
+            self.entry_output.insert(0, path)
+
+    def log(self, message):
+        self.txt_log.config(state=tk.NORMAL)
+        self.txt_log.insert(tk.END, message + "\n")
+        self.txt_log.see(tk.END)
+        self.txt_log.config(state=tk.DISABLED)
+
+    def process_queue(self):
+        """
+        【Bug#1 修复】轮询消息队列，更新UI
+        将 latest_progress 的更新放在 try-except 外部，确保能正确执行
+        """
+        latest_progress = None
+
+        try:
+            while True:
+                msg = self.msg_queue.get_nowait()
+                msg_type = msg[0]
+
+                if msg_type == "LOG":
+                    self.log(msg[1])
+                elif msg_type == "STATUS":
+                    self.lbl_status.config(text=f"状态: {msg[1]}")
+                elif msg_type == "FILE_NAME":
+                    self.lbl_file.config(text=f"当前文件: {msg[1]}")
+                elif msg_type == "PROG_TOTAL":
+                    self.prog_total['value'] = msg[1]
+                elif msg_type == "PROG_FILE":
+                    # 只记录，不立即更新（防止高频刷新卡顿）
+                    latest_progress = msg[1]
+                elif msg_type == "ASK_PWD":
+                    pwd = simpledialog.askstring(
+                        "设置密码",
+                        "请输入压缩包密码（取消则不加密）:",
+                        show="*", parent=self.root
+                    )
+                    msg[2].put(pwd)
+                elif msg_type == "DONE":
+                    self.task_finished()
+
+        except queue.Empty:
+            pass
+
+        # 【关键修复】放在 try-except 外面，确保无论是否发生异常都能执行
+        if latest_progress is not None:
+            self.prog_file['value'] = latest_progress
+
+        self.root.after(100, self.process_queue)
+
+    def start_task(self):
+        if not self.seven_zip_path:
+            messagebox.showerror("错误", "未找到 7-Zip 引擎！\n请安装 7-Zip 或将 7z.exe 放在同目录。")
+            return
+
+        source_dir = self.entry_source.get().strip()
+        if not source_dir or not os.path.isdir(source_dir):
+            messagebox.showerror("错误", "请选择有效的总文件夹路径！")
+            return
+
+        output_dir = self.entry_output.get().strip()
+        if not output_dir or output_dir == "默认保存在总文件夹内":
+            output_dir = None
+
+        self.is_running = True
+        self.btn_start.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
+
+        self.txt_log.config(state=tk.NORMAL)
+        self.txt_log.delete(1.0, tk.END)
+        self.txt_log.config(state=tk.DISABLED)
+        self.prog_total['value'] = 0
+        self.prog_file['value'] = 0
+
+        thread = threading.Thread(
+            target=self.worker_thread,
+            args=(source_dir, output_dir, self.var_pwd.get(), self.var_del.get()),
+            daemon=True
+        )
+        thread.start()
+
+    def stop_task(self):
+        """
+        【Bug#3 修复】停止任务时不阻塞主线程
+        只发送 terminate 信号，不等待
+        """
+        self.is_running = False
+        self.log("⚠️ 正在强制终止 7-Zip 进程...")
+        if self.process:
+            try:
+                self.process.terminate()
+            except Exception:
+                pass
+        self.btn_stop.config(state=tk.DISABLED)
+
+    def task_finished(self):
+        self.is_running = False
+        self.btn_start.config(state=tk.NORMAL)
+        self.btn_stop.config(state=tk.DISABLED)
+        self.lbl_status.config(text="状态: 已完成 / 已停止")
+        self.lbl_file.config(text="当前文件: -")
+        self.prog_file['value'] = 0
+
+    def worker_thread(self, source_dir, output_dir, use_password, delete_source):
+        if output_dir is None:
+            output_dir = source_dir
+        os.makedirs(output_dir, exist_ok=True)
+        source_dir = os.path.abspath(source_dir)
+        output_dir = os.path.abspath(output_dir)
+
+        folders = [
+            item for item in os.listdir(source_dir)
+            if os.path.isdir(os.path.join(source_dir, item))
+        ]
+        total_folders = len(folders)
+
+        if total_folders == 0:
+            self.msg_queue.put(("LOG", "未找到任何子文件夹。"))
+            self.msg_queue.put(("DONE",))
+            return
+
+        # 获取密码
+        password = None
+        if use_password:
+            pwd_queue = queue.Queue()
+            self.msg_queue.put(("ASK_PWD", None, pwd_queue))
+            password = pwd_queue.get()
+            if not password:
+                self.msg_queue.put(("LOG", "⚠️ 未输入密码，按不加密处理。"))
+                password = None
+
+        for idx, item in enumerate(folders):
+            if not self.is_running:
+                break
+
+            item_path = os.path.join(source_dir, item)
+            zip_name = f"{item}.7z"
+            archive_path = os.path.join(output_dir, zip_name)
+
+            progress_percent = (idx / total_folders) * 100
+            self.msg_queue.put(("PROG_TOTAL", progress_percent))
+            self.msg_queue.put(("STATUS", f"正在处理 ({idx + 1}/{total_folders}): {item}"))
+            self.msg_queue.put(("FILE_NAME", item))
+            self.msg_queue.put(("LOG", f"\n{'=' * 30}\n📦 开始压缩: {item}"))
+
+            # 【Bug#2 修复】构建命令时，将排除参数放在选项区域（archive_path 之前）
+            cmd = [
+                self.seven_zip_path, "a",
+                "-t7z",
+                "-mmt=on",
+                "-mx=5",
+                "-bsp1"
+            ]
+
+            # 如果输出目录与源目录相同，排除正在生成的压缩包自身
+            if output_dir == source_dir:
+                cmd.append(f"-x!{zip_name}")
+
+            cmd.append(archive_path)
+            cmd.append(item_path)
+
+            if password:
+                cmd.append(f"-p{password}")
+                cmd.append("-mhe=on")
+
+            try:
+                self.process = subprocess.Popen(
+                    cmd,
+                    cwd=source_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding=self.console_encoding,
+                    errors='replace'
+                )
+
+                for line in self.process.stdout:
+                    if not self.is_running:
+                        self.process.terminate()
+                        try:
+                            self.process.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            self.process.kill()
+                        break
+                    match = re.search(r'(\d+)%', line)
+                    if match:
+                        percent = int(match.group(1))
+                        self.msg_queue.put(("PROG_FILE", percent))
+
+                self.process.wait()
+
+                if not self.is_running:
+                    self.msg_queue.put(("LOG", "⛔ 任务被用户中止。"))
+                    if os.path.exists(archive_path):
+                        try:
+                            os.remove(archive_path)
+                        except Exception:
+                            pass
+                    break
+
+                if self.process.returncode == 0:
+                    self.msg_queue.put(("PROG_FILE", 100))
+                    self.msg_queue.put(("LOG", f"✅ 压缩完成: {zip_name}"))
+
+                    # 校验与删除
+                    if delete_source:
+                        self.msg_queue.put(("LOG", "   🔍 正在调用 7z 进行完整性测试..."))
+                        test_cmd = [self.seven_zip_path, "t", archive_path]
+                        if password:
+                            test_cmd.append(f"-p{password}")
+
+                        test_process = subprocess.run(
+                            test_cmd,
+                            capture_output=True,
+                            text=True,
+                            encoding=self.console_encoding,
+                            errors='replace'
+                        )
+
+                        if test_process.returncode == 0:
+                            self.msg_queue.put(("LOG", "   ✅ 完整性测试通过！"))
+                            try:
+                                shutil.rmtree(item_path, onerror=force_remove_readonly)
+                                self.msg_queue.put(("LOG", f"   🗑️ 源文件夹已安全删除: {item}"))
+                            except Exception as del_err:
+                                self.msg_queue.put(("LOG", f"   ⚠️ 删除失败: {del_err}"))
+                        else:
+                            self.msg_queue.put(("LOG", f"   ⚠️ 危险拦截：7z 测试失败！跳过删除 [{item}]"))
+                else:
+                    self.msg_queue.put(("LOG", f"❌ 压缩失败，7z 返回码: {self.process.returncode}"))
+                    if os.path.exists(archive_path):
+                        try:
+                            os.remove(archive_path)
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                self.msg_queue.put(("LOG", f"❌ 发生异常: {e}"))
+                if os.path.exists(archive_path):
+                    try:
+                        os.remove(archive_path)
+                    except Exception:
+                        pass
+
+        self.msg_queue.put(("PROG_TOTAL", 100))
+        self.msg_queue.put(("LOG", f"\n🎉 所有任务处理完毕！"))
+        self.msg_queue.put(("DONE",))
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = CompressApp7Z(root)
+
+    def on_closing():
+        """
+        【Bug#3 修复】关闭窗口时，只发终止信号，不阻塞等待
+        """
+        if app.is_running:
+            if messagebox.askokcancel("退出", "任务正在进行中，确定要强制退出吗？"):
+                app.is_running = False
+                if app.process:
+                    try:
+                        app.process.terminate()
+                    except Exception:
+                        pass
+                root.destroy()
+        else:
+            root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    root.mainloop()
